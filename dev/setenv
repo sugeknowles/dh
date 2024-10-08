@@ -1,0 +1,182 @@
+deactivate 2>/dev/null
+
+export FUNCS=$(declare -F | awk '$NF ~ /^[^_]/ {print $NF}' | paste -s)
+
+pypath_add() {
+    PYTHONPATH=$(echo "$PYTHONPATH" | tr ':' '\n' | (
+        echo "$1"
+        xargs -r
+    ) | paste -s -d':')
+}
+
+pypath_rm() {
+    PYTHONPATH=$(echo $PYTHONPATH | tr ':' '\n' | grep -v -F "$1" | paste -s -d':')
+}
+
+get_choice() {
+    if [ $# -gt 1 ]; then
+        PS3="Select item from list: "
+        select option in "$@"; do
+            if [ -z "$option" ]; then
+                echo >&2 "Incorrect Input: Select a number 1-$#"
+            else
+                echo $option
+                return
+            fi
+        done
+    elif [ $# -eq 1 ]; then
+        echo $*
+        return
+    fi
+}
+
+activate_venv() {
+    readarray -t options < <(git ls-files -o "*activate")
+    choice=$(get_choice "${options[@]}")
+    source $choice
+}
+
+activate_venv || {
+    echo "Activation of venv failed!"
+    return 1
+}
+
+BRANCH_COLOR="\[\e[38;5;220m\]"
+PATH_COLOR="\[\e[1;34m\]"
+AUTH_COLOR='\[\e[1;31m\]'
+USER_COLOR='\[\e[1;32m\]'
+NO_COLOR='\[\e[0m\]'
+
+update_ps1() {
+    user_color=$USER_COLOR
+    if [[ "$SSH_TTY" || "$USER" == "root" ]]; then
+        user_color=$AUTH_COLOR
+    fi
+    branch=$(git branch --no-color 2>/dev/null | sed -n 's/^\* //p')
+    PS1="[foundation] ($BRANCH_COLOR${branch:-_}$NO_COLOR) $user_color\u@\h$NO_COLOR:$PATH_COLOR\w$NO_COLOR\$ "
+}
+
+PROMPT_COMMAND=update_ps1
+
+eval orig_$(declare -f deactivate)
+unset -f deactivate
+deactivate() {
+    unset PROMPT_COMMAND
+    orig_deactivate
+    pypath_rm "$(git rev-parse --show-toplevel)/foundation"
+    export PYTHONPATH
+    declare -A funcs
+    for func in $FUNCS; do
+        funcs[$func]=1
+    done
+    unset FUNCS
+    while read func; do
+        [ "${funcs[$func]}" ] || unset -f $func
+    done < <(declare -F | awk '$NF ~ /^[^_]/ {print $NF}')
+}
+
+pypath_add "$(git rev-parse --show-toplevel)/foundation"
+export PYTHONPATH
+
+export PATH="$(git rev-parse --show-toplevel)/foundation/bin:$PATH"
+
+dbash() {
+    pattern=$1
+    readarray -t options < <(dls | sed 1d | awk '$1 ~ /'$pattern'/ {print $1" "$2}')
+    choice=$(get_choice "${options[@]}")
+    read c_name c_id <<<"$choice"
+    docker exec -it $c_id bash
+}
+
+dsh() {
+    pattern=$1
+    readarray -t options < <(dls | sed 1d | awk '$1 ~ /'$pattern'/ {print $1" "$2}')
+    choice=$(get_choice "${options[@]}")
+    read c_name c_id <<<"$choice"
+    docker exec -it $c_id sh
+}
+
+dkill() {
+    if [ "$1" = "-a" ]; then
+        docker rm -f $(docker ps --format "{{.Names}}") | sed 's/$/ killed./'
+        return
+    fi
+    pattern=$1
+    readarray -t options < <(dls | sed 1d | awk '$1 ~ /'$pattern'/ {print $1" "$2}')
+    choice=$(get_choice "${options[@]}")
+    read c_name c_id <<<"$choice"
+    docker rm -f $c_id
+    echo "$c_name killed."
+}
+
+dtail() {
+    cmd="docker logs"
+    pattern=$1
+    if [ "$pattern" = "-f" ]; then
+        cmd="$cmd $pattern"
+        pattern=${@:2}
+    fi
+    readarray -t options < <(dls | sed 1d | awk '$1 ~ /'$pattern'/ {print $1" "$2}')
+    choice=$(get_choice "${options[@]}")
+    read c_name c_id <<<"$choice"
+    $cmd $c_id
+}
+
+dup() {
+    services=$(docker compose config --services | grep -f <(printf "%s\n" "$@"))
+    if [ -n "$services" ]; then
+        docker compose up -d $services
+    else
+        echo "No matching services found."
+    fi
+}
+
+dub() {
+    services=$(docker compose config --services | grep -f <(printf "%s\n" "$@"))
+    if [ -n "$services" ]; then
+        docker compose up -d --build $services
+    else
+        echo "No matching services found."
+    fi
+}
+
+ddown() {
+    services=$(docker compose config --services | grep -f <(printf "%s\n" "$@"))
+    if [ -n "$services" ]; then
+        docker compose down $services
+    else
+        echo "No matching services found."
+    fi
+}
+
+dlogl() {
+    pattern=$1
+    level=$2
+    prefix=$3
+    readarray -t options < <(dls | sed 1d | awk '$1 ~ /'$pattern'/ {print $1" "$2}')
+    choice=$(get_choice "${options[@]}")
+    read c_name c_id <<<"$choice"
+    docker exec -it $c_id sh -c "echo '${prefix}LOG_LEVEL=$level' | tee /tmp/log_level_pipe.$c_id"
+}
+
+dls() {
+    (
+        echo "NAMES|CONTAINER ID|STATE|UPTIME"
+        containers=$(docker ps -q)
+        now=$(date -u +%s)
+        for c_id in $containers; do
+            read c_name c_status c_started <<< $(docker inspect -f '{{ .Name }} {{ .State.Status }} {{ .State.StartedAt }}' $c_id)
+            total_seconds=$((now - $(date --date $c_started +%s)))
+            days=$((total_seconds / 86400))
+            hours=$(((total_seconds % 86400) / 3600))
+            minutes=$(((total_seconds % 3600) / 60))
+            seconds=$((total_seconds % 60))
+            printf "${c_name:1}|$c_id|$c_status|%dd-%02dh:%02dm:%02ds\n" $days $hours $minutes $seconds
+        done
+    ) | column -t -s'|' | (read -r header && echo "$header" && sort -k1)
+}
+
+alias dc='docker compose'
+alias dstart='docker compose start'
+alias dstop='docker compose stop'
+alias drestart='docker compose restart'
